@@ -1,0 +1,351 @@
+// ============================================================
+//  Jenkinsfile — sync-service
+//  Supports: qa (develop), staging (release/*), prod (main)
+// ============================================================
+
+pipeline {
+
+    agent any
+
+    // ── Tool versions ────────────────────────────────────────
+    tools {
+        maven 'maven-3.9'
+        jdk   'jdk-17'
+    }
+
+    // ── Parameters (used for manual rollback) ────────────────
+    parameters {
+        booleanParam(name: 'ROLLBACK',    defaultValue: false, description: 'Trigger manual rollback')
+        string(name:  'TARGET_TAG',       defaultValue: '',    description: 'Image tag to roll back to (required when ROLLBACK=true)')
+    }
+
+    // ── Environment variables ─────────────────────────────────
+    environment {
+        SERVICE_NAME      = 'sync-service'
+        ARTIFACT_REGISTRY = 'us-central1-docker.pkg.dev/my-gcp-project/sync-service'
+        GCS_STATE_BUCKET  = 'gs://sync-service-deploy-state'
+        SHORT_SHA         = "${GIT_COMMIT[0..6]}"
+
+        // Resolved per branch in stages below
+        TARGET_ENV        = ''
+        IMAGE_TAG         = ''
+        SPRING_PROFILE    = ''
+    }
+
+    // ── Build triggers ────────────────────────────────────────
+    triggers {
+        // Poll SCM every 2 min (replace with webhook in production)
+        pollSCM('H/2 * * * *')
+    }
+
+    options {
+        timestamps()
+        timeout(time: 45, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        disableConcurrentBuilds()           // prevent race conditions per branch
+        ansiColor('xterm')
+    }
+
+    stages {
+
+        // ── 0. Resolve environment from branch ───────────────
+        stage('Resolve Environment') {
+            steps {
+                script {
+                    if (env.BRANCH_NAME == 'main') {
+                        env.TARGET_ENV     = 'prod'
+                        env.SPRING_PROFILE = 'prod'
+                    } else if (env.BRANCH_NAME.startsWith('release/')) {
+                        env.TARGET_ENV     = 'staging'
+                        env.SPRING_PROFILE = 'staging'
+                    } else if (env.BRANCH_NAME == 'develop') {
+                        env.TARGET_ENV     = 'qa'
+                        env.SPRING_PROFILE = 'qa'
+                    } else {
+                        env.TARGET_ENV     = 'ci-only'   // PR / feature branch — no deploy
+                        env.SPRING_PROFILE = 'qa'
+                    }
+
+                    env.IMAGE_TAG = "${env.SERVICE_NAME}:${env.TARGET_ENV}-${env.SHORT_SHA}"
+                    echo "Branch: ${env.BRANCH_NAME} → Environment: ${env.TARGET_ENV}"
+                    echo "Image tag: ${env.IMAGE_TAG}"
+                }
+            }
+        }
+
+        // ── 1. Checkout (already done by Jenkins, just report) ─
+        stage('Checkout') {
+            steps {
+                echo "Checked out ${env.BRANCH_NAME} @ ${env.GIT_COMMIT}"
+            }
+        }
+
+        // ── 2. Build & Unit Tests ─────────────────────────────
+        stage('Build & Unit Test') {
+            steps {
+                sh './mvnw clean verify -Dspring.profiles.active=${SPRING_PROFILE} -B -q'
+            }
+            post {
+                always {
+                    junit 'target/surefire-reports/**/*.xml'
+                    jacoco execPattern: 'target/jacoco.exec',
+                           classPattern: 'target/classes',
+                           sourcePattern: 'src/main/java'
+                }
+            }
+        }
+
+        // ── 3. Code Quality Gate ──────────────────────────────
+        stage('Code Quality') {
+            when {
+                anyOf {
+                    branch 'develop'
+                    branch pattern: 'release/.*', comparator: 'REGEXP'
+                    branch 'main'
+                    changeRequest()          // PRs also get scanned
+                }
+            }
+            steps {
+                withSonarQubeEnv('SonarQube') {
+                    sh './mvnw sonar:sonar -B -q'
+                }
+                timeout(time: 5, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+        // ── 4. Package Docker Image ───────────────────────────
+        stage('Package') {
+            when {
+                not { expression { env.TARGET_ENV == 'ci-only' } }
+            }
+            steps {
+                sh """
+                    docker build \
+                        --build-arg SPRING_PROFILE=${env.SPRING_PROFILE} \
+                        -t ${env.ARTIFACT_REGISTRY}/${env.IMAGE_TAG} \
+                        .
+                """
+            }
+        }
+
+        // ── 5. Push to Artifact Registry ─────────────────────
+        stage('Push Artifact') {
+            when {
+                not { expression { env.TARGET_ENV == 'ci-only' } }
+            }
+            steps {
+                withCredentials([file(credentialsId: 'gcp-sa-key', variable: 'GCP_SA_KEY')]) {
+                    sh """
+                        gcloud auth activate-service-account --key-file=\$GCP_SA_KEY
+                        gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
+                        docker push ${env.ARTIFACT_REGISTRY}/${env.IMAGE_TAG}
+                    """
+                }
+            }
+        }
+
+        // ── 6a. Manual Rollback (parameter-driven) ───────────
+        stage('Manual Rollback') {
+            when {
+                expression { params.ROLLBACK == true }
+            }
+            steps {
+                script {
+                    def rollbackTag = params.TARGET_TAG?.trim()
+                    if (!rollbackTag) {
+                        // Fall back to last stable tag stored in GCS
+                        rollbackTag = sh(
+                            script: "gsutil cat ${env.GCS_STATE_BUCKET}/${env.TARGET_ENV}/last_stable_tag",
+                            returnStdout: true
+                        ).trim()
+                    }
+                    echo "Rolling back ${env.TARGET_ENV} to: ${rollbackTag}"
+                    deployToEnv(env.TARGET_ENV, rollbackTag)
+                }
+            }
+            post {
+                always {
+                    script { currentBuild.result = 'UNSTABLE' }
+                    notifySlack("⏪ Manual rollback executed on *${env.TARGET_ENV}*")
+                }
+            }
+        }
+
+        // ── 6b. Prod Approval Gate ────────────────────────────
+        stage('Prod Approval') {
+            when {
+                allOf {
+                    branch 'main'
+                    not { expression { params.ROLLBACK } }
+                }
+            }
+            steps {
+                timeout(time: 30, unit: 'MINUTES') {
+                    input message: "Deploy *${env.IMAGE_TAG}* to PRODUCTION?",
+                          ok: 'Approve',
+                          submitter: 'devops-leads,release-managers'
+                }
+            }
+        }
+
+        // ── 7. Deploy ─────────────────────────────────────────
+        stage('Deploy') {
+            when {
+                allOf {
+                    not { expression { env.TARGET_ENV == 'ci-only' } }
+                    not { expression { params.ROLLBACK } }
+                }
+            }
+            steps {
+                script {
+                    deployToEnv(env.TARGET_ENV, env.IMAGE_TAG)
+                }
+            }
+        }
+
+        // ── 8. Smoke Test ─────────────────────────────────────
+        stage('Smoke Test') {
+            when {
+                allOf {
+                    not { expression { env.TARGET_ENV == 'ci-only' } }
+                    not { expression { params.ROLLBACK } }
+                }
+            }
+            steps {
+                script {
+                    def passed = sh(
+                        script: "bash scripts/smoke_test.sh ${env.TARGET_ENV}",
+                        returnStatus: true
+                    ) == 0
+
+                    if (passed) {
+                        echo "Smoke tests passed — saving stable tag."
+                        sh "echo '${env.IMAGE_TAG}' | gsutil cp - ${env.GCS_STATE_BUCKET}/${env.TARGET_ENV}/last_stable_tag"
+                    } else {
+                        echo "Smoke test FAILED — initiating automatic rollback."
+                        def lastStableTag = sh(
+                            script: "gsutil cat ${env.GCS_STATE_BUCKET}/${env.TARGET_ENV}/last_stable_tag",
+                            returnStdout: true
+                        ).trim()
+
+                        if (lastStableTag) {
+                            echo "Rolling back to: ${lastStableTag}"
+                            deployToEnv(env.TARGET_ENV, lastStableTag)
+                        } else {
+                            echo "No last stable tag found — manual intervention required."
+                        }
+
+                        if (env.TARGET_ENV == 'prod') {
+                            notifyPagerDuty("Prod deploy failed and rollback triggered for ${env.IMAGE_TAG}")
+                        }
+
+                        error("Smoke test failed — deployment rolled back.")
+                    }
+                }
+            }
+        }
+
+    }   // end stages
+
+    // ── Post pipeline ─────────────────────────────────────────
+    post {
+        success {
+            notifySlack("*${env.SERVICE_NAME}* deployed to *${env.TARGET_ENV}* — `${env.IMAGE_TAG}`")
+        }
+        failure {
+            notifySlack("Pipeline failed for *${env.SERVICE_NAME}* on *${env.BRANCH_NAME}* — `${env.IMAGE_TAG}`")
+        }
+        unstable {
+            notifySlack("Pipeline unstable for *${env.SERVICE_NAME}* on *${env.BRANCH_NAME}*")
+        }
+        always {
+            cleanWs()
+        }
+    }
+
+}  
+
+// ───────────────────────
+//  Shared helper functions
+// ───────────────────────
+def deployToEnv(String env, String imageTag) {
+    def migName    = "sync-service-mig-${env}"
+    def region     = 'us-central1'
+    def saCredId   = (env == 'prod') ? 'gcp-sa-key-prod' : 'gcp-sa-key'
+    
+    // FETCH SECRETS (Assignment Requirement: Secrets handling for MongoDB)
+    def mongoCredId = (env == 'prod') ? 'mongodb-uri-prod' : 'mongodb-uri-nonprod'
+
+    withCredentials([
+        file(credentialsId: saCredId, variable: 'GCP_SA_KEY'),
+        string(credentialsId: mongoCredId, variable: 'MONGO_URI')
+    ]) {
+        sh """
+            gcloud auth activate-service-account --key-file=\$GCP_SA_KEY
+
+            # JUSTIFICATION (Assignment Requirement: Justify Deployment Strategy)
+            # Strategy: Rolling Update
+            # Why: 
+            # 1. Zero Downtime: max-unavailable=0 ensures we never drop below 100% capacity.
+            # 2. Resource Efficiency: We don't need a full secondary cluster (like Blue/Green), 
+            #    reducing cloud costs for the sync-service.
+            # 3. Safety: Managed Instance Groups automatically revert if health checks fail.
+
+            # Update the instance template used by the MIG
+            # Secrets are passed as metadata which Spring Boot picks up as environment variables
+            gcloud compute instance-templates create sync-service-tpl-${imageTag.replaceAll(':', '-')} \
+                --machine-type=n2-standard-2 \
+                --metadata=IMAGE_TAG=${imageTag},SPRING_PROFILES_ACTIVE=${env},SPRING_DATA_MONGODB_URI=\$MONGO_URI \
+                --region=${region}
+
+            # Rolling update execution
+            gcloud compute instance-groups managed rolling-action start-update ${migName} \
+                --version=template=sync-service-tpl-${imageTag.replaceAll(':', '-')} \
+                --max-surge=1 \
+                --max-unavailable=0 \
+                --region=${region}
+
+            # Wait for the rollout to complete
+            gcloud compute instance-groups managed wait-until ${migName} \
+                --version-target-reached \
+                --region=${region} \
+                --timeout=600
+        """
+    }
+}
+
+/**
+ * Send a Slack notification to the #deployments channel.
+ */
+def notifySlack(String message) {
+    withCredentials([string(credentialsId: 'slack-webhook-url', variable: 'SLACK_URL')]) {
+        sh """
+            curl -s -X POST \$SLACK_URL \
+                -H 'Content-type: application/json' \
+                -d '{"text": "${message}"}'
+        """
+    }
+}
+
+/**
+ * Trigger a PagerDuty incident (prod failures only).
+ */
+def notifyPagerDuty(String summary) {
+    withCredentials([string(credentialsId: 'pagerduty-routing-key', variable: 'PD_KEY')]) {
+        sh """
+            curl -s -X POST https://events.pagerduty.com/v2/enqueue \
+                -H 'Content-Type: application/json' \
+                -d '{
+                    "routing_key": "\$PD_KEY",
+                    "event_action": "trigger",
+                    "payload": {
+                        "summary": "${summary}",
+                        "severity": "critical",
+                        "source": "jenkins"
+                    }
+                }'
+        """
+    }
+}
